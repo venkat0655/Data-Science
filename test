@@ -1,0 +1,114 @@
+DECLARE @DateRangeStart DATE = getdate()-6
+				DECLARE @DateRangeEnd DATE = getdate()+1
+				DECLARE @TargetMarkupSetArtifactID INT = 1034197
+				DECLARE @OnlyFinalized BIT=0
+;WITH 
+MaxActionCTE AS (
+    SELECT 
+        AP.ArtifactID,
+        TRY_CONVERT(XML, Details).value('(//imageMarkup/@id)[1]', 'nvarchar(max)') REDACTIONID,
+        AP.[Action] AS MaxAction,
+        AP.UserID AS MaxActionUserID,
+        AP.[TimeStamp] AS MaxActionTimeStamp,
+        TRY_CONVERT(XML, AP.Details).value('(//imageMarkup/@pageNumber)[1]', 'nvarchar(max)') PageNumber,
+        ROW_NUMBER() OVER (PARTITION BY AP.ArtifactID, TRY_CONVERT(XML, Details).value('(//imageMarkup/@id)[1]', 'nvarchar(max)') ORDER BY AP.[Action] DESC, AP.[TimeStamp] DESC) AS rn
+    FROM 
+        eddsdbo.AuditRecord_PrimaryPartition AP (NOLOCK)
+    WHERE 
+        AP.[Action] IN (20, 21, 22)
+        AND TRY_CONVERT(XML, AP.Details) IS NOT NULL
+        AND TRY_CONVERT(XML, AP.Details).value('(//imageMarkup/@markupSetArtifactID)[1]', 'nvarchar(max)') = @TargetMarkupSetArtifactID
+        AND AP.[TimeStamp] BETWEEN @DateRangeStart AND @DateRangeEnd
+),
+MinActionCTE AS (
+    SELECT 
+        AP.ArtifactID,
+       TRY_CONVERT(XML, Details).value('(//imageMarkup/@id)[1]', 'nvarchar(max)') REDACTIONID,
+        AP.[Action] AS MinAction,
+        AP.UserID AS MinActionUserID,
+        AP.[TimeStamp] AS MinActionTimeStamp,
+        TRY_CONVERT(XML, AP.Details).value('(//imageMarkup/@X)[1]', 'nvarchar(max)') MinX,
+        TRY_CONVERT(XML, AP.Details).value('(//imageMarkup/@Y)[1]', 'nvarchar(max)') MinY,
+        TRY_CONVERT(XML, AP.Details).value('(//imageMarkup/@Width)[1]', 'nvarchar(max)') MinWidth,
+        TRY_CONVERT(XML, AP.Details).value('(//imageMarkup/@Height)[1]', 'nvarchar(max)') MinHeight
+    FROM 
+        eddsdbo.AuditRecord_PrimaryPartition AP (NOLOCK)
+    WHERE 
+        AP.[Action] =20
+        AND EXISTS(
+                    SELECT 1  FROM MaxActionCTE X WHERE X.ArtifactID=AP.ArtifactID AND X.REDACTIONID=TRY_CONVERT(XML, AP.Details).value('(//imageMarkup/@id)[1]', 'nvarchar(max)')
+        ) 
+        -- MinAction can occur before or within the daterange ,so no date filter here
+)
+,
+LatestAudit AS (
+        SELECT 
+            M.ArtifactID,
+            M.RedactionID,
+            M.MinAction,
+            AU1.FullName AS MinActionUserFullName,
+            M.MinActionTimeStamp,
+            X.MaxAction,
+            AU2.FullName AS MaxActionUserFullName,
+            X.MaxActionTimeStamp,
+            X.PageNumber,
+            COALESCE(RED.X, '') AS CurrentRedactionX,
+            COALESCE(RED.Y, '') AS CurrentRedactionY,
+            COALESCE(RED.Width, '') AS CurrentRedactionWidth,
+            COALESCE(RED.Height, '') AS CurrentRedactionHeight,
+            COALESCE(RED.[Text], '') AS CurrentRedactionText
+            -- OriginalRedaction concatenated x,y,width,height for MinAction=20
+            ,CASE WHEN (M.MinAction=20 AND X.MaxAction IN(21,22) AND M.MinActionUserID=777 AND X.MaxActionUserID<>777)
+                THEN CONCAT('X: ',M.MinX,', Y: ',M.MinY,', Width: ',m.MinWidth,', Height: ',M.MinHeight) 
+                ELSE NULL END AS OriginalRedaction
+            ,RED.ExternalRedactionID
+
+        FROM 
+            MinActionCTE M
+            JOIN MaxActionCTE X ON M.ArtifactID = X.ArtifactID AND M.RedactionID = X.RedactionID
+            JOIN eddsdbo.AuditUser AU1 ON M.MinActionUserID = AU1.UserID
+            JOIN eddsdbo.AuditUser AU2 ON X.MaxActionUserID = AU2.UserID
+            LEFT JOIN EDDSDBO.Redaction RED ON M.REDACTIONID = RED.ID
+        WHERE 
+            X.rn = 1
+            AND(   
+                    (M.MinAction=20 AND X.MaxAction=20) -- Include all results both min action and max action is 20
+                    OR
+                    (M.MinAction=20 AND X.MaxAction IN(21,22) AND M.MinActionUserID=777 AND X.MaxActionUserID<>777) -- Min action is 20 and Max action is 21 or 22
+            )
+            AND ISNULL(RED.MarkupType,0)<>2
+        -- ORDER BY 	M.ArtifactID, M.RedactionID
+    )
+    SELECT 
+        REQ.RequestID,
+        D.Artifactid DocumentArtifactID,   
+        D.META_FILENAME DocumentFilename, 
+        PageNumber,
+        LA.REDACTIONID,
+        CASE WHEN LA.[MaxAction] =20 THEN 1 ELSE 0 END IsAdded,
+        CASE WHEN LA.MaxAction =22 THEN 1 ELSE 0 END IsDeleted ,
+        CurrentRedactionX,
+        CurrentRedactionY,
+        CurrentRedactionWidth,
+        CurrentRedactionHeight,
+        CurrentRedactionText,
+        @TargetMarkupSetArtifactID AS MarkupSetArtifactID,
+		LA.MinActionTimeStamp,
+        LA.MaxActionTimeStamp LastModifiedDate,
+        LA.ExternalRedactionID,
+		LA.MinActionUserFullName,
+        LA.MaxActionUserFullName UserName,
+        LA.OriginalRedaction,
+        LA.MinAction,
+        LA.MaxAction
+       
+    FROM
+        EDDSDBO.Document(NOLOCK) D
+    JOIN EDDSDBO.Request REQ ON D.Request=REQ.ArtifactID   
+    LEFT JOIN
+        LatestAudit LA ON D.Artifactid = LA.ArtifactID
+   
+   WHERE  (ISNULL(D.ReviewFinalized,0)=@OnlyFinalized OR @OnlyFinalized=0 )  AND LA.REDACTIONID IS NOT NULL
+
+        ORDER BY
+        REQ.REQUESTID,LA.ArtifactID, LA.PageNumber, LA.REDACTIONID, LA.MaxActionTimeStamp
